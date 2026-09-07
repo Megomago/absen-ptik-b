@@ -126,7 +126,12 @@ async function cloudUpsertCell(course, sid, meet, v){
 }
 async function cloudSaveMeeting(course){
   if(!cloudReady) return;
-  await sb.from("courses").upsert({name:course, meetings:state.meetings[course]},{onConflict:"name"});
+  try{
+    suppressRealtime = true;
+    await sb.from("courses").upsert({name:course, meetings:state.meetings[course]},{onConflict:"name"});
+    setSaveInfo("☁ " + timeNow());
+  }catch(e){}
+  finally{ setTimeout(()=>suppressRealtime=false, 800); }
 }
 async function bulkSyncCourse(course){
   if(!cloudReady) return;
@@ -192,19 +197,49 @@ async function load(){
   }
 }
 
+async function reloadAttendance(){
+  const {data} = await sb.from("attendance").select("*").eq("course", state.current).limit(10000);
+  state.data[state.current] = {};
+  (data||[]).forEach(a=>{
+    if(!state.data[a.course]) state.data[a.course]={};
+    if(!state.data[a.course][a.student_id]) state.data[a.course][a.student_id]={};
+    state.data[a.course][a.student_id][a.meeting]=a.status;
+  });
+}
+async function reloadStudents(){
+  const {data} = await sb.from("students").select("*").limit(5000);
+  if(data) state.students = data.map(s=>({id:s.id, nim:s.nim, nama:s.nama, jk:s.jk}));
+}
+async function reloadCourses(){
+  const {data} = await sb.from("courses").select("*").limit(5000);
+  if(data?.length){
+    const cur = state.current;
+    state.courses = data.map(c=>c.name);
+    state.meetings = {};
+    data.forEach(c=>state.meetings[c.name]=c.meetings||16);
+    if(!state.courses.includes(cur)) state.current = state.courses[0];
+  }
+}
+
 function subscribeRealtime(){
   sb.channel("absensi-live")
     .on("postgres_changes",{event:"*",schema:"public",table:"attendance"}, async ()=>{
       if(suppressRealtime || bulkLock) return;
-      const {data} = await sb.from("attendance").select("*").eq("course", state.current).limit(10000);
-      state.data[state.current] = {};
-      (data||[]).forEach(a=>{
-        if(!state.data[a.course]) state.data[a.course]={};
-        if(!state.data[a.course][a.student_id]) state.data[a.course][a.student_id]={};
-        state.data[a.course][a.student_id][a.meeting]=a.status;
-      });
+      await reloadAttendance();
       render();
-      setSaveInfo("☁ update " + timeNow());
+      setSaveInfo("☁ update absen " + timeNow());
+    })
+    .on("postgres_changes",{event:"*",schema:"public",table:"students"}, async ()=>{
+      if(suppressRealtime || bulkLock) return;
+      await reloadStudents();
+      render();
+      setSaveInfo("☁ update mhs " + timeNow());
+    })
+    .on("postgres_changes",{event:"*",schema:"public",table:"courses"}, async ()=>{
+      if(suppressRealtime || bulkLock) return;
+      await reloadCourses();
+      save(); render();
+      setSaveInfo("☁ update matkul " + timeNow());
     })
     .subscribe();
 }
@@ -330,7 +365,8 @@ function wireCells(){
     const delId = b.dataset.del;
     state.students = state.students.filter(s=>s.id!==delId);
     save(); render();
-    try{ await sb.from("students").delete().eq("id", delId); }catch(err){}
+    try{ suppressRealtime=true; await sb.from("students").delete().eq("id", delId); }catch(err){}
+    finally{ setTimeout(()=>suppressRealtime=false, 800); }
   });
 }
 document.addEventListener("mouseup", ()=>{ if(isPainting){isPainting=false; save(); render();} });
@@ -390,7 +426,8 @@ $("btnHadirSemua").onclick = async ()=>{
 $("btnReset").onclick = async ()=>{
   if(!confirm("Reset?")) return;
   delete state.data[state.current]; save(); render();
-  try{ await sb.from("attendance").delete().eq("course", state.current); }catch(e){}
+  try{ suppressRealtime=true; await sb.from("attendance").delete().eq("course", state.current); }catch(e){}
+  finally{ setTimeout(()=>suppressRealtime=false, 800); }
 };
 $("btnAddMhs").onclick = async ()=>{
   const nama=$("newNama").value.trim(), nim=$("newNim").value.trim()||("5252451"+String(state.students.length+1).padStart(3,"0"));
@@ -398,14 +435,16 @@ $("btnAddMhs").onclick = async ()=>{
   const st={id:"mhs-"+Date.now(),nim,nama};
   state.students.push(st);
   $("newNama").value=""; $("newNim").value=""; save(); render();
-  try{ await sb.from("students").upsert({id:st.id, nim:st.nim, nama:st.nama, jk:""},{onConflict:"id"}); }catch(e){}
+  try{ suppressRealtime=true; await sb.from("students").upsert({id:st.id, nim:st.nim, nama:st.nama, jk:""},{onConflict:"id"}); }catch(e){}
+  finally{ setTimeout(()=>suppressRealtime=false, 800); }
 };
 $("btnAddMatkul").onclick = async ()=>{
   const v=$("newMatkul").value.trim(); if(!v) return;
   if(state.courses.includes(v)) return;
   state.courses.push(v); state.meetings[v]=16; state.current=v;
   $("newMatkul").value=""; save(); render();
-  try{ await sb.from("courses").upsert({name:v, meetings:16},{onConflict:"name"}); }catch(e){}
+  try{ suppressRealtime=true; await sb.from("courses").upsert({name:v, meetings:16},{onConflict:"name"}); }catch(e){}
+  finally{ setTimeout(()=>suppressRealtime=false, 800); }
 };
 $("btnExport").onclick = ()=>{
   const course=state.current, n=state.meetings[course];
