@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Mahasigma PTIK B - Absensi</title>
 <link rel="stylesheet" href="style.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
 <header>
@@ -79,31 +80,29 @@
 
 <script src="data-matkul.js"></script>
 <script src="data-mahasiswa.js"></script>
+<script src="supabase-config.js"></script>
 <script>
 const EMOT = {H:"✅", S:"🤒", A:"❌", "":""};
 const NEXT = {"":"H","H":"S","S":"A","A":""};
 
-const LS_KEY = "mahasigma_absensi_v2";
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const LS_KEY = "mahasigma_absensi_current";
 let state = { courses:[...DEFAULT_COURSES], students:JSON.parse(JSON.stringify(DEFAULT_STUDENTS)), meetings:{}, data:{}, current:DEFAULT_COURSES[0] };
+let cloudReady = false, bulkLock = false, suppressRealtime = false;
 
 function defaultMeetings(){ const o={}; state.courses.forEach(c=>o[c]=16); return o; }
 
-function load(){
-  try{
-    const raw = localStorage.getItem(LS_KEY);
-    if(!raw){ state.meetings = defaultMeetings(); return; }
-    const s = JSON.parse(raw);
-    if(s.courses?.length) state.courses = s.courses;
-    if(s.students?.length) state.students = s.students;
-    state.meetings = s.meetings || defaultMeetings();
-    state.data = s.data || {};
-    state.current = s.current && state.courses.includes(s.current) ? s.current : state.courses[0];
-    state.courses.forEach(c=>{ if(!state.meetings[c]) state.meetings[c]=16; else if(state.meetings[c]===14) state.meetings[c]=16; });
-  }catch(e){ state.meetings = defaultMeetings(); }
+function setSaveInfo(t, isErr){
+  const el = document.getElementById("saveInfo");
+  el.textContent = t;
+  el.style.color = isErr ? "#f87171" : "#9ca3af";
 }
+function timeNow(){ return new Date().toLocaleTimeString("id-ID",{hour:'2-digit',minute:'2-digit',second:'2-digit'}); }
+
+// simpan lokal (cache pilihan matkul) + indikator UI
 function save(){
-  localStorage.setItem(LS_KEY, JSON.stringify(state));
-  document.getElementById("saveInfo").textContent = new Date().toLocaleTimeString("id-ID",{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  try{ localStorage.setItem(LS_KEY, JSON.stringify({current:state.current})); }catch(e){}
+  setSaveInfo("💾 " + timeNow());
 }
 function getVal(course, sid, meet){ return (state.data[course]?.[sid]?.[meet]) || ""; }
 function setVal(course, sid, meet, v){
@@ -111,6 +110,103 @@ function setVal(course, sid, meet, v){
   if(!state.data[course][sid]) state.data[course][sid]= {};
   if(!v) delete state.data[course][sid][meet];
   else state.data[course][sid][meet]=v;
+  if(!bulkLock) cloudUpsertCell(course, sid, meet, v);
+}
+
+// ---- Supabase sync ----
+async function cloudUpsertCell(course, sid, meet, v){
+  if(!cloudReady) return;
+  try{
+    suppressRealtime = true;
+    if(!v) await sb.from("attendance").delete().match({course, student_id:sid, meeting:meet});
+    else await sb.from("attendance").upsert({course, student_id:sid, meeting:meet, status:v},{onConflict:"course,student_id,meeting"});
+    setSaveInfo("☁ " + timeNow());
+  }catch(e){ setSaveInfo("⚠ offline - tersimpan lokal", true); }
+  finally{ setTimeout(()=>suppressRealtime=false, 800); }
+}
+async function cloudSaveMeeting(course){
+  if(!cloudReady) return;
+  await sb.from("courses").upsert({name:course, meetings:state.meetings[course]},{onConflict:"name"});
+}
+async function bulkSyncCourse(course){
+  if(!cloudReady) return;
+  try{
+    suppressRealtime = true;
+    const rows = [];
+    const per = state.data[course] || {};
+    Object.entries(per).forEach(([sid, meets])=>{
+      Object.entries(meets).forEach(([m, v])=>{
+        if(v) rows.push({course, student_id:sid, meeting:+m, status:v});
+      });
+    });
+    await sb.from("attendance").delete().eq("course", course);
+    if(rows.length) {
+      // upsert per 200 biar aman
+      for(let i=0;i<rows.length;i+=200){
+        await sb.from("attendance").upsert(rows.slice(i,i+200),{onConflict:"course,student_id,meeting"});
+      }
+    }
+    setSaveInfo("☁ " + timeNow());
+  }catch(e){ setSaveInfo("⚠ offline", true); }
+  finally{ setTimeout(()=>suppressRealtime=false, 1000); }
+}
+
+async function load(){
+  setSaveInfo("⏳ menghubungkan...");
+  try{ const raw = localStorage.getItem(LS_KEY); if(raw){ const c=JSON.parse(raw); if(c.current) state.current=c.current; } }catch(e){}
+  try{
+    let {data: courses} = await sb.from("courses").select("*").limit(5000);
+    let {data: students} = await sb.from("students").select("*").limit(5000);
+    let {data: att} = await sb.from("attendance").select("*").limit(10000);
+
+    // seed pertama kali kalau kosong
+    if((!courses || !courses.length) && (!students || !students.length)){
+      await sb.from("courses").upsert(DEFAULT_COURSES.map(c=>({name:c, meetings:16})),{onConflict:"name"});
+      await sb.from("students").upsert(DEFAULT_STUDENTS.map(s=>({id:s.id, nim:s.nim, nama:s.nama, jk:s.jk||""})),{onConflict:"id"});
+      const r1 = await sb.from("courses").select("*").limit(5000);
+      const r2 = await sb.from("students").select("*").limit(5000);
+      courses = r1.data; students = r2.data; att = [];
+    }
+
+    if(courses?.length){
+      state.courses = courses.map(c=>c.name);
+      state.meetings = {};
+      courses.forEach(c=>state.meetings[c.name]=c.meetings||16);
+    } else state.meetings = defaultMeetings();
+    if(students?.length) state.students = students.map(s=>({id:s.id, nim:s.nim, nama:s.nama, jk:s.jk}));
+    if(!state.courses.includes(state.current)) state.current = state.courses[0];
+
+    state.data = {};
+    (att||[]).forEach(a=>{
+      if(!state.data[a.course]) state.data[a.course]={};
+      if(!state.data[a.course][a.student_id]) state.data[a.course][a.student_id]={};
+      state.data[a.course][a.student_id][a.meeting]=a.status;
+    });
+    cloudReady = true;
+    setSaveInfo("☁ tersambung " + timeNow());
+    subscribeRealtime();
+  }catch(e){
+    console.error(e);
+    state.meetings = defaultMeetings();
+    setSaveInfo("⚠ offline - pakai data bawaan", true);
+  }
+}
+
+function subscribeRealtime(){
+  sb.channel("absensi-live")
+    .on("postgres_changes",{event:"*",schema:"public",table:"attendance"}, async ()=>{
+      if(suppressRealtime || bulkLock) return;
+      const {data} = await sb.from("attendance").select("*").eq("course", state.current).limit(10000);
+      state.data[state.current] = {};
+      (data||[]).forEach(a=>{
+        if(!state.data[a.course]) state.data[a.course]={};
+        if(!state.data[a.course][a.student_id]) state.data[a.course][a.student_id]={};
+        state.data[a.course][a.student_id][a.meeting]=a.status;
+      });
+      render();
+      setSaveInfo("☁ update " + timeNow());
+    })
+    .subscribe();
 }
 
 const $ = id => document.getElementById(id);
@@ -212,21 +308,29 @@ function wireCells(){
     btn.onmouseup = ()=>{ if(isPainting){isPainting=false; save(); render();} };
     btn.onclick = e=>{ selectCell(btn.dataset.sid, +btn.dataset.meet); };
   });
-  document.querySelectorAll("[data-fill]").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("[data-fill]").forEach(b=>b.onclick=async ()=>{
     const m=+b.dataset.fill;
+    bulkLock = true;
     visibleStudents().forEach(st=>setVal(state.current,st.id,m,"H"));
+    bulkLock = false;
     save(); render();
+    await bulkSyncCourse(state.current);
   });
-  document.querySelectorAll("[data-clear]").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("[data-clear]").forEach(b=>b.onclick=async ()=>{
     const m=+b.dataset.clear;
+    bulkLock = true;
     visibleStudents().forEach(st=>setVal(state.current,st.id,m,""));
+    bulkLock = false;
     save(); render();
+    await bulkSyncCourse(state.current);
   });
-  document.querySelectorAll("[data-del]").forEach(b=>b.onclick=e=>{
+  document.querySelectorAll("[data-del]").forEach(b=>b.onclick=async e=>{
     e.stopPropagation();
     if(!confirm("Hapus?")) return;
-    state.students = state.students.filter(s=>s.id!==b.dataset.del);
+    const delId = b.dataset.del;
+    state.students = state.students.filter(s=>s.id!==delId);
     save(); render();
+    try{ await sb.from("students").delete().eq("id", delId); }catch(err){}
   });
 }
 document.addEventListener("mouseup", ()=>{ if(isPainting){isPainting=false; save(); render();} });
@@ -264,9 +368,9 @@ document.addEventListener("keydown", e=>{
 });
 
 $("courseSelect").onchange = e=>{ state.current=e.target.value; selected=null; save(); render(); };
-$("meetCount").onchange = e=>{ let v=Math.min(Math.max(+e.target.value||1,1),30); state.meetings[state.current]=v; save(); render(); };
-$("meetPlus").onclick = ()=>{ state.meetings[state.current]=Math.min(state.meetings[state.current]+1,30); save(); render(); };
-$("meetMinus").onclick = ()=>{ state.meetings[state.current]=Math.max(state.meetings[state.current]-1,1); save(); render(); };
+$("meetCount").onchange = e=>{ let v=Math.min(Math.max(+e.target.value||1,1),30); state.meetings[state.current]=v; save(); render(); cloudSaveMeeting(state.current); };
+$("meetPlus").onclick = ()=>{ state.meetings[state.current]=Math.min(state.meetings[state.current]+1,30); save(); render(); cloudSaveMeeting(state.current); };
+$("meetMinus").onclick = ()=>{ state.meetings[state.current]=Math.max(state.meetings[state.current]-1,1); save(); render(); cloudSaveMeeting(state.current); };
 $("search").oninput = render;
 $("filter").onchange = render;
 $("brushes").onclick = e=>{
@@ -274,27 +378,34 @@ $("brushes").onclick = e=>{
   brush=b.dataset.brush;
   document.querySelectorAll("#brushes button").forEach(x=>x.classList.toggle("active",x===b));
 };
-$("btnHadirSemua").onclick = ()=>{
+$("btnHadirSemua").onclick = async ()=>{
   if(!confirm("✅ semua?")) return;
   const n=state.meetings[state.current];
+  bulkLock = true;
   visibleStudents().forEach(st=>{ for(let m=0;m<n;m++) setVal(state.current,st.id,m,"H"); });
+  bulkLock = false;
   save(); render();
+  await bulkSyncCourse(state.current);
 };
-$("btnReset").onclick = ()=>{
+$("btnReset").onclick = async ()=>{
   if(!confirm("Reset?")) return;
   delete state.data[state.current]; save(); render();
+  try{ await sb.from("attendance").delete().eq("course", state.current); }catch(e){}
 };
-$("btnAddMhs").onclick = ()=>{
+$("btnAddMhs").onclick = async ()=>{
   const nama=$("newNama").value.trim(), nim=$("newNim").value.trim()||("5252451"+String(state.students.length+1).padStart(3,"0"));
   if(!nama) return;
-  state.students.push({id:"mhs-"+Date.now(),nim,nama});
+  const st={id:"mhs-"+Date.now(),nim,nama};
+  state.students.push(st);
   $("newNama").value=""; $("newNim").value=""; save(); render();
+  try{ await sb.from("students").upsert({id:st.id, nim:st.nim, nama:st.nama, jk:""},{onConflict:"id"}); }catch(e){}
 };
-$("btnAddMatkul").onclick = ()=>{
+$("btnAddMatkul").onclick = async ()=>{
   const v=$("newMatkul").value.trim(); if(!v) return;
   if(state.courses.includes(v)) return;
   state.courses.push(v); state.meetings[v]=16; state.current=v;
   $("newMatkul").value=""; save(); render();
+  try{ await sb.from("courses").upsert({name:v, meetings:16},{onConflict:"name"}); }catch(e){}
 };
 $("btnExport").onclick = ()=>{
   const course=state.current, n=state.meetings[course];
@@ -311,7 +422,7 @@ $("btnExport").onclick = ()=>{
   a.click();
 };
 
-load(); render();
+render(); load().then(()=>render());
 </script>
 </body>
 </html>
