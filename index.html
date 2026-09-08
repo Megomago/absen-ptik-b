@@ -72,7 +72,7 @@
 
   <div class="panel">
     <div class="row">
-      <div class="field"><div style="display:flex;gap:4px"><input type="text" id="newNama" placeholder="Nama" style="min-width:140px"><input type="text" id="newNim" placeholder="NIM" style="min-width:90px"><button id="btnAddMhs">+</button></div></div>
+      <div class="field"><div style="display:flex;gap:4px"><input type="text" id="newNama" placeholder="Nama" style="min-width:140px"><input type="text" id="newNim" placeholder="NIM" style="min-width:90px"><button id="btnAddOne" title="Matkul ini saja">+ Ini</button><button id="btnAddAll" title="Semua matkul">+ Semua</button></div></div>
       <div class="field"><div style="display:flex;gap:4px"><input type="text" id="newMatkul" placeholder="Matkul"><button id="btnAddMatkul">+</button></div></div>
     </div>
   </div>
@@ -87,7 +87,7 @@ const NEXT = {"":"H","H":"S","S":"A","A":""};
 
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 const LS_KEY = "mahasigma_absensi_current";
-let state = { courses:[...DEFAULT_COURSES], students:JSON.parse(JSON.stringify(DEFAULT_STUDENTS)), meetings:{}, data:{}, current:DEFAULT_COURSES[0] };
+let state = { courses:[...DEFAULT_COURSES], students:JSON.parse(JSON.stringify(DEFAULT_STUDENTS)), meetings:{}, data:{}, roster:{}, rosterReady:false, rosterAll:true, current:DEFAULT_COURSES[0] };
 let cloudReady = false, bulkLock = false, suppressRealtime = false;
 
 function defaultMeetings(){ const o={}; state.courses.forEach(c=>o[c]=16); return o; }
@@ -181,6 +181,23 @@ async function load(){
     if(students?.length) state.students = students.map(s=>({id:s.id, nim:s.nim, nama:s.nama, jk:s.jk}));
     if(!state.courses.includes(state.current)) state.current = state.courses[0];
 
+    try{
+      const {data: enr, error: enrErr} = await sb.from("enrollments").select("*").limit(10000);
+      if(enrErr) throw enrErr;
+      state.roster = {};
+      (enr||[]).forEach(e=>{ (state.roster[e.course] ||= []).push(e.student_id); });
+      state.rosterReady = true; state.rosterAll = false;
+      if(!enr?.length && state.students.length && state.courses.length){
+        const rows=[];
+        state.courses.forEach(c=>state.students.forEach(s=>rows.push({course:c, student_id:s.id})));
+        rows.forEach(r=>(state.roster[r.course] ||= []).push(r.student_id));
+        (async()=>{ try{ for(let i=0;i<rows.length;i+=500) await sb.from("enrollments").upsert(rows.slice(i,i+500),{onConflict:"course,student_id"}); }catch(e){} })();
+      }
+      ensureRosterKeys();
+      const ids=new Set(state.students.map(s=>s.id));
+      Object.keys(state.roster).forEach(c=>state.roster[c]=state.roster[c].filter(id=>ids.has(id)));
+    }catch(e){ state.rosterReady=false; state.rosterAll=true; }
+
     state.data = {};
     (att||[]).forEach(a=>{
       if(!state.data[a.course]) state.data[a.course]={};
@@ -218,7 +235,29 @@ async function reloadCourses(){
     state.meetings = {};
     data.forEach(c=>state.meetings[c.name]=c.meetings||16);
     if(!state.courses.includes(cur)) state.current = state.courses[0];
+    ensureRosterKeys();
   }
+}
+
+function ensureRosterKeys(){
+  if(!(state.rosterReady && !state.rosterAll)) return;
+  const all=state.students.map(s=>s.id);
+  state.courses.forEach(c=>{ if(!state.roster[c]) state.roster[c]=[...all]; });
+}
+async function reloadEnrollments(){
+  try{
+    const {data, error} = await sb.from("enrollments").select("*").limit(10000);
+    if(error) throw error;
+    state.roster = {};
+    (data||[]).forEach(e=>{ (state.roster[e.course] ||= []).push(e.student_id); });
+    state.rosterReady = true; state.rosterAll = false;
+    ensureRosterKeys();
+  }catch(e){}
+}
+function enrolledStudents(){
+  if(!state.rosterReady || state.rosterAll) return [...state.students];
+  const map=new Map(state.students.map(s=>[s.id,s]));
+  return (state.roster[state.current]||[]).map(id=>map.get(id)).filter(Boolean);
 }
 
 function subscribeRealtime(){
@@ -240,6 +279,12 @@ function subscribeRealtime(){
       await reloadCourses();
       save(); render();
       setSaveInfo("☁ update matkul " + timeNow());
+    })
+    .on("postgres_changes",{event:"*",schema:"public",table:"enrollments"}, async ()=>{
+      if(suppressRealtime || bulkLock) return;
+      await reloadEnrollments();
+      render();
+      setSaveInfo("☁ update peserta " + timeNow());
     })
     .subscribe();
 }
@@ -266,7 +311,7 @@ function hitungRekap(sid){
 
 function visibleStudents(){
   const q=$("search").value.trim().toLowerCase(), f=$("filter").value;
-  return state.students.filter(st=>{
+  return enrolledStudents().filter(st=>{
     if(q && !(st.nama.toLowerCase().includes(q)||st.nim.toLowerCase().includes(q))) return false;
     const r=hitungRekap(st.id);
     if(f==="kritis" && r.pct>=75) return false;
@@ -306,9 +351,10 @@ function render(){
   });
 
   let th2=0, krit=0;
-  state.students.forEach(st=>{ const r=hitungRekap(st.id); th2+=r.h; if(r.pct<75) krit++; });
-  const totalSel = state.students.length*n || 1;
-  $("stMhs").textContent=state.students.length;
+  const enrolled=enrolledStudents();
+  enrolled.forEach(st=>{ const r=hitungRekap(st.id); th2+=r.h; if(r.pct<75) krit++; });
+  const totalSel = enrolled.length*n || 1;
+  $("stMhs").textContent=enrolled.length;
   $("stHadir").textContent=th2;
   $("stAvg").textContent=Math.round(th2/totalSel*100)+"%";
   $("stKritis").textContent=krit;
@@ -361,11 +407,15 @@ function wireCells(){
   });
   document.querySelectorAll("[data-del]").forEach(b=>b.onclick=async e=>{
     e.stopPropagation();
-    if(!confirm("Hapus?")) return;
-    const delId = b.dataset.del;
-    state.students = state.students.filter(s=>s.id!==delId);
+    if(!confirm("Keluarkan dari matkul ini?")) return;
+    const delId = b.dataset.del, course = state.current;
+    if(state.roster[course]) state.roster[course]=state.roster[course].filter(id=>id!==delId);
+    if(state.data[course]?.[delId]) delete state.data[course][delId];
     save(); render();
-    try{ suppressRealtime=true; await sb.from("students").delete().eq("id", delId); }catch(err){}
+    try{ suppressRealtime=true;
+      await sb.from("enrollments").delete().match({course, student_id:delId});
+      await sb.from("attendance").delete().match({course, student_id:delId});
+    }catch(err){}
     finally{ setTimeout(()=>suppressRealtime=false, 800); }
   });
 }
@@ -429,19 +479,37 @@ $("btnReset").onclick = async ()=>{
   try{ suppressRealtime=true; await sb.from("attendance").delete().eq("course", state.current); }catch(e){}
   finally{ setTimeout(()=>suppressRealtime=false, 800); }
 };
-$("btnAddMhs").onclick = async ()=>{
-  const nama=$("newNama").value.trim(), nim=$("newNim").value.trim()||("5252451"+String(state.students.length+1).padStart(3,"0"));
+async function addStudent(mode){
+  const nama=$("newNama").value.trim();
+  let nim=$("newNim").value.trim();
   if(!nama) return;
-  const st={id:"mhs-"+Date.now(),nim,nama};
-  state.students.push(st);
-  $("newNama").value=""; $("newNim").value=""; save(); render();
-  try{ suppressRealtime=true; await sb.from("students").upsert({id:st.id, nim:st.nim, nama:st.nama, jk:""},{onConflict:"id"}); }catch(e){}
+  if(!nim) nim="5252451"+String(state.students.length+1).padStart(3,"0");
+  let st=state.students.find(s=>s.nim===nim);
+  try{ suppressRealtime=true;
+    if(!st){
+      st={id:"mhs-"+Date.now(),nim,nama,jk:""};
+      state.students.push(st);
+      await sb.from("students").upsert({id:st.id, nim:st.nim, nama:st.nama, jk:""},{onConflict:"id"});
+    }
+    if(state.rosterReady && !state.rosterAll){
+      const targets = mode==="all" ? state.courses : [state.current];
+      targets.forEach(c=>{ (state.roster[c] ||= []).includes(st.id) || state.roster[c].push(st.id); });
+      await sb.from("enrollments").upsert(targets.map(c=>({course:c, student_id:st.id})),{onConflict:"course,student_id"});
+    }
+  }catch(e){}
   finally{ setTimeout(()=>suppressRealtime=false, 800); }
-};
+  $("newNama").value=""; $("newNim").value=""; save(); render();
+}
+$("btnAddOne").onclick = ()=>addStudent("one");
+$("btnAddAll").onclick = ()=>addStudent("all");
 $("btnAddMatkul").onclick = async ()=>{
   const v=$("newMatkul").value.trim(); if(!v) return;
   if(state.courses.includes(v)) return;
   state.courses.push(v); state.meetings[v]=16; state.current=v;
+  if(state.rosterReady && !state.rosterAll){
+    state.roster[v]=state.students.map(s=>s.id);
+    try{ await sb.from("enrollments").upsert(state.students.map(s=>({course:v, student_id:s.id})),{onConflict:"course,student_id"}); }catch(e){}
+  }
   $("newMatkul").value=""; save(); render();
   try{ suppressRealtime=true; await sb.from("courses").upsert({name:v, meetings:16},{onConflict:"name"}); }catch(e){}
   finally{ setTimeout(()=>suppressRealtime=false, 800); }
@@ -449,7 +517,7 @@ $("btnAddMatkul").onclick = async ()=>{
 $("btnExport").onclick = ()=>{
   const course=state.current, n=state.meetings[course];
   let csv="No;NIM;Nama;"+Array.from({length:n},(_,i)=>"P"+(i+1)).join(";")+";H;S;A;%\n";
-  state.students.forEach((st,i)=>{
+  enrolledStudents().forEach((st,i)=>{
     const r=hitungRekap(st.id);
     const row=Array.from({length:n},(_,m)=>getVal(course,st.id,m)||"-").join(";");
     csv+=`${i+1};${st.nim};"${st.nama}";${row};${r.h};${r.s};${r.a};${r.pct}\n`;
